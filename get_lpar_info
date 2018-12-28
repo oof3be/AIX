@@ -1,0 +1,96 @@
+VER="1.4"
+
+# Parameter checks
+if [ ${#*} -ne 0 ]
+then
+        while getopts :vVh:u: PARMS
+        do
+                case $PARMS in
+                        v|V)    echo "This is get_lpar_info version: $VER" ; exit ;;
+                     h)     HMC_LIST=`echo $OPTARG | tr ',' ' '` ;;
+                     u)     HMC_USER=${OPTARG} ;;
+                        ?)      echo "\nUSAGE:\t$0 [ -v, -V, -h, -u ]"
+                                echo "\t-v or -V will print out the version and exit"
+                                echo "\t-h HMC hostname(s) or IP address(es) COMMA SEPARATED to use"
+                                echo "\t-u HMC userid to use (only required if hscroot not used)\n"
+                           echo "EXAMPLE: get_lpar_info -h hmc1,hmc2\n"
+                                exit ;;
+                esac
+        done
+fi
+
+for HMC in ${HMC_LIST}
+do
+       ssh ${HMC_USER}@${HMC} date >/dev/null 2>/dev/null
+       if [ $? -ne 0 ]
+       then
+              echo "\nPassword-less SSH access to HMC ${HMC} with user ${HMC_USER} is not setup\n"
+              continue
+       fi
+       echo -e "\n================================="
+       echo "HARDWARE MANAGEMENT CONSOLE"
+       echo -e "Hostname: ${HMC} / \c"
+       ssh ${HMC_USER}@${HMC} "lshmc -v | grep -E 'TM|SE|RM'" | sed 's/eserver xSeries 336 -\[//g' | sed 's/]-//g' | tr -s '\n' ' ' | awk '
+       {MODEL = $2 ; SERIAL = $4 ; VERSION = $6};
+       END { print "Model: " MODEL "\nSerial: " SERIAL " / Ver: " VERSION}'
+       echo "`date`"
+       echo "================================="
+       MANAGEDSYS=`ssh ${HMC_USER}@${HMC} "lssyscfg -r sys -F type_model*serial_num|sort"`
+
+       for SYSTEM in ${MANAGEDSYS}
+       do
+              echo -e "\nIBM POWER SYSTEM: ${SYSTEM} / SysFW Ver: \c"
+              ssh ${HMC_USER}@${HMC} "lslic -m ${SYSTEM} -F ecnumber:activated_level|sed 's/:/_/g'|cut -c 3-"|tr -s '\n' ' '
+
+              ssh ${HMC_USER}@${HMC} "lshwres -m ${SYSTEM} -r proc --level sys -F installed_sys_proc_units:configurable_sys_proc_units:curr_avail_sys_proc_units"|awk -F: '
+              {INSTALL = $1 ; CONFIG = $2 ; AVAIL = $3};
+              END { print "\n   PROC INFO:\t" INSTALL " Installed / " CONFIG " Configurable / " CONFIG-AVAIL " Used / " AVAIL " Available "}'
+
+              ssh ${HMC_USER}@${HMC} "lshwres -m ${SYSTEM} -r mem --level sys -F installed_sys_mem:configurable_sys_mem:curr_avail_sys_mem:sys_firmware_mem:mem_region_size" |awk -F: '
+              {INSTALL = $1 ; CONFIG = $2 ; AVAIL = $3 ; SYSFW = $4 ; LMB = $5};
+              END { print "   MEM INFO:\t" INSTALL/1024 " GB Install / " CONFIG/1024 " GB Config / " (CONFIG-AVAIL)/1024 " GB Used / " AVAIL/1024 " GB Avail / " SYSFW/1024 " GB SysFW / " LMB " MB L MB"}'
+
+              echo -e "   LPAR INFO:   NOTE: THE MEMORY AND PROCESSOR VALUES ARE FROM THE ACTIVE/RUNNING LPAR VALUES (NOT FROM LPAR PROFILE)\n   ID  NAME                 TYPE      OS_VER                   STATE        MEM(GB) MODE    PROC    MODE             POOL  ENT  VP  WT ENT/VP"
+
+              Get_LPAR_Info() {
+                     LPARS=`ssh ${HMC_USER}@${HMC} "lssyscfg -r lpar -m ${SYSTEM} -F lpar_id:name:lpar_env:os_version:state|sed 's/ /_/g'|sort -n"`
+                     for LPAR in ${LPARS}
+                     do
+                           printf "      %-24s\n" ${LPAR}
+                     done
+
+              PROC=`ssh ${HMC_USER}@${HMC} "lshwres -m ${SYSTEM} -r proc --level lpar -F lpar_id:curr_proc_mode:curr_sharing_mode:curr_shared_proc_pool_id:run_proc_units:run_procs:run_uncap_weight|sort -n"`
+              for LPAR in ${PROC}
+              do
+                     printf "      %-24s\n" ${LPAR}
+              done
+
+              ssh ${HMC_USER}@${HMC} "lshwres -m ${SYSTEM} -r mem --level lpar -F lpar_id:mem_mode:run_mem" >/dev/null 2>/dev/null
+              if [ $? -eq 0 ]
+              then
+                     MEM=`ssh ${HMC_USER}@${HMC} "lshwres -m ${SYSTEM} -r mem --level lpar -F lpar_id:mem_mode:run_mem|sort -n"`
+                     for LPAR in ${MEM}
+                     do
+                           printf "      %-24s\n" ${LPAR}
+                     done
+              else
+                     MEM=`ssh ${HMC_USER}@${HMC} "lshwres -m ${SYSTEM} -r mem --level lpar -F lpar_id:run_mem|sort -n"`
+                     for LPAR in ${MEM}
+                     do
+                           printf "      %-24s\n" ${LPAR}
+                     done
+              fi
+              }
+
+              Get_LPAR_Info | sort -n | awk -F: '{
+              if (NF == 5) { LPAR_ID=$1; LPAR_NAME=$2; OS_TYPE=$3; OS_VER=$4; STATE=$5 }
+              if (NF == 3) { MEM_MODE=$2; MEM=$3 }
+              if (NF == 2) { MEM_MODE="NA"; MEM=$2 }
+              if (NF == 7) { PROC_MODE=$2; SHARE_MODE=$3; SHARED_POOL=$4; PROC_UNITS=$5; VIRT_PROC=$6; WEIGHT=$7 }
+              if ((length(LPAR_ID) != 0 && length(MEM_MODE) !=0 && length(PROC_MODE) != 0)) {
+              if (VIRT_PROC == 0) { RATIO = "NA"  } else { RATIO = PROC_UNITS/VIRT_PROC}
+              printf "   %3d %-20s %-9s %-24s %-13s %5.1f %-8s %-7s %-17s %-3d %-4.2f %3d %3d %5.2f\n", LPAR_ID, LPAR_NAME, OS_TYPE, OS_VER, STATE, MEM/1024, MEM_MODE, PROC_MODE, SHARE_MODE, SHARED_POOL, PROC_UNITS, VIRT_PROC, WEIGHT, RATIO; TOTAL_MEM += MEM; TOTAL_PROC_UNITS += PROC_UNITS; TOTAL_VIRT_PROC += VIRT_PROC ; LPAR_ID=""; MEM_MODE=""; MEM=""; PROC_MODE="" }
+              } END {print "    -----------------------------------------------------------------------------------------------------------------------------------------" ; printf "       LPAR TOTALS %63.1f %43.2f %3d %9.2f\n", TOTAL_MEM/1024, TOTAL_PROC_UNITS, TOTAL_VIRT_PROC, TOTAL_PROC_UNITS/TOTAL_VIRT_PROC}'
+       done
+done
+
